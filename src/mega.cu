@@ -73,19 +73,19 @@ struct Cfg {
     int NL, maxseq, P, eos, stop_eos, teacher, prof, tchunk, spec, ngmax;
     float spec_slope;                       // cost of each extra token in a step, relative to a 1-token step
     int glm, ts;                            // lm_head row groups; per-token stride of block scales
-    int off_xd, off_xs8, off_hb, off_red, off_wts, off_cand, off_scale, off_hist;   // dynamic smem layout (bytes)
+    int off_xd, off_xs8, off_hb, off_red, off_cand, off_scale, off_hist;   // dynamic smem layout (bytes)
     float eps, rope_base, inv_sqrt_hd;
     PM lm; const float* out_norm; const uint8_t* emb; int emb_q8;   // emb: raw Q4_0 (18 B) or Q8_0 (34 B) blocks
     float *h, *q, *am, *al, *ao, *act_d, *kc, *vc;      // per-token buffers are [TMAX][...]
     int8_t* act_q; int* act_s8; Cand* cand; const int* prompt;
-    int *r_count, *r_tok; long long* r_ns; float* r_margin;   // host-mapped ring
+    int *r_count, *r_tok; long long* r_ns; float* r_margin;   // host-mapped ring (count, tokens); device: ns, margins
     long long* stats;                       // [gen steps, drafted, accepted]
 };
 __constant__ Cfg C;
 __constant__ Layer LY[64];
 
 // dynamic shared memory: [ union: int8 activations (T tokens) + split partials | attention
-// scratch ] [ xd | xs8 | hb | red | wts | cand | scale ] — offsets computed on the host. Views are
+// scratch ] [ xd | xs8 | hb | red | cand | scale ] — offsets computed on the host. Views are
 // derived from the __shared__ symbol itself (not passed as pointers), so even out-of-line functions
 // address it with LDS/STS instead of generic loads.
 extern __shared__ __align__(16) unsigned char smem[];
@@ -100,39 +100,35 @@ struct Smem {
     __device__ static int* xs8() { return reinterpret_cast<int*>(smem + C.off_xs8); }
     __device__ static float* hb() { return reinterpret_cast<float*>(smem + C.off_hb); }
     __device__ static float* red() { return reinterpret_cast<float*>(smem + C.off_red); }
-    __device__ static float* wts() { return reinterpret_cast<float*>(smem + C.off_wts); }
     __device__ static Cand* cand() { return reinterpret_cast<Cand*>(smem + C.off_cand); }
     __device__ static float* scale() { return reinterpret_cast<float*>(smem + C.off_scale); }
     __device__ static int* hist() { return reinterpret_cast<int*>(smem + C.off_hist); }   // token at each position
 };
 
 // ---------------- primitives ----------------
-__device__ unsigned g_bar_count, g_bar_gen;
-__device__ unsigned long long g_prof[32], g_clk[4];   // g_clk: clock64/globaltimer at kernel start/end   // PROFILE=1: ns per phase on CTA 0 (critical path)
+__device__ unsigned g_bar_count;                        // grid-barrier arrivals since launch (host zeroes it)
+__shared__ unsigned s_bar_target;                       // this CTA's arrival count at the next barrier
+__device__ unsigned long long g_prof[32], g_clk[4];   // g_clk: clock64/globaltimer at kernel start/end
+__shared__ unsigned long long s_prof[32];              // PROFILE=1: SM cycles per phase on CTA 0 (critical path)
 __device__ __forceinline__ unsigned long long gtime() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; }
-// close the current phase k: charge the time since the last mark to g_prof[k]
+__device__ __forceinline__ unsigned long long pnow() { return C.prof ? clock64() : 0; }
+// close the current phase k: charge the cycles since the last mark to s_prof[k] (shared memory and
+// clock64, so a mark costs a few cycles instead of a global read-modify-write on the critical path)
 __device__ __forceinline__ void mark(unsigned long long& t, int k) {
-    if (C.prof && blockIdx.x == 0 && threadIdx.x == 0) { unsigned long long n = gtime(); g_prof[k] += n - t; t = n; }
+    if (C.prof && blockIdx.x == 0 && threadIdx.x == 0) { unsigned long long n = clock64(); s_prof[k] += n - t; t = n; }
 }
 __device__ __forceinline__ unsigned ld_acquire(const unsigned* p) {
     unsigned v; asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v;
 }
-__device__ __forceinline__ void st_release(unsigned* p, unsigned v) {
-    asm volatile("st.release.gpu.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
-}
-// sense-reversing grid barrier (all CTAs co-resident: cooperative launch)
+// grid barrier (all CTAs co-resident: cooperative launch) on a monotonic arrival counter: the last
+// CTA's arrival is itself the release, so the critical path is one atomic plus one poll — the
+// sense-reversing version (read generation, add, reset, publish) cost ~2.7 us per barrier
 __device__ __forceinline__ void grid_sync() {
     __syncthreads();
     if (threadIdx.x == 0) {
-        __threadfence();
-        unsigned gen = ld_acquire(&g_bar_gen);
-        if (atomicAdd(&g_bar_count, 1u) == gridDim.x - 1) {
-            atomicExch(&g_bar_count, 0u);
-            st_release(&g_bar_gen, gen + 1);
-        } else {
-            while (ld_acquire(&g_bar_gen) == gen) {}
-        }
-        __threadfence();
+        const unsigned target = s_bar_target += gridDim.x;
+        asm volatile("red.release.gpu.global.add.u32 [%0], 1;" :: "l"(&g_bar_count) : "memory");
+        while ((int)(ld_acquire(&g_bar_count) - target) < 0) {}
     }
     __syncthreads();
 }
@@ -301,25 +297,38 @@ __device__ __noinline__ void gemv_seq(const PM& M, int g0, int ng, int poff, int
     if (M.cb == 8) gemv_seq_t<8>(M, g0, ng, poff, t0, T, xs, warp, lane);
     else           gemv_seq_t<4>(M, g0, ng, poff, t0, T, xs, warp, lane);
 }
-// symmetric int8 per 32-block, exactly cuda_infer's quant_x_q8 (lane = element)
-// (the shuffles run even when !own, so callers can keep a block-uniform trip count)
-__device__ __forceinline__ void quant32(float v, int b, int8_t* xq, float* xd, int* xs8, int lane, bool own = true) {
-    float a = fabsf(v);
+// symmetric int8 per 32-block, exactly cuda_infer's quant_x_q8 (lane = element), for K blocks b[k]
+// of one warp at once so their shuffle chains overlap. The shuffles run even when !own[k], so
+// callers can keep a block-uniform trip count.
+template<int K>
+__device__ __forceinline__ void quant32(const float (&v)[K], const int (&b)[K], const bool (&own)[K], int8_t* xq, float* xd, int* xs8, int lane) {
+    float a[K]; int q[K];
     #pragma unroll
-    for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(FULL, a, o));
-    const float inv = (a > 0.f) ? 127.f / a : 0.f;
-    const int q = __float2int_rn(v * inv);
-    if (own) xq[b * 32 + lane] = (int8_t)q;
-    int s = q;
+    for (int k = 0; k < K; k++) a[k] = fabsf(v[k]);
     #pragma unroll
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
-    if (own && lane == 0) { xd[b] = __half2float(__float2half(a / 127.f)); xs8[b] = 8 * s; }
+    for (int o = 16; o; o >>= 1)
+        #pragma unroll
+        for (int k = 0; k < K; k++) a[k] = fmaxf(a[k], __shfl_xor_sync(FULL, a[k], o));
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        const float inv = (a[k] > 0.f) ? 127.f / a[k] : 0.f;
+        q[k] = __float2int_rn(v[k] * inv);
+        if (own[k]) xq[b[k] * 32 + lane] = (int8_t)q[k];
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1)
+        #pragma unroll
+        for (int k = 0; k < K; k++) q[k] += __shfl_xor_sync(FULL, q[k], o);
+    #pragma unroll
+    for (int k = 0; k < K; k++)
+        if (own[k] && lane == 0) { xd[b[k]] = __half2float(__float2half(a[k] / 127.f)); xs8[b[k]] = 8 * q[k]; }
 }
-// token vectors X[t][E] (t < T, staged in smem) -> optionally rmsnorm(x_t) * w -> int8 blocks of
-// each token in smem. Every loop that holds a shuffle has a block-uniform trip count so the warp
-// stays provably converged; each token gets exactly the arithmetic of a lone token.
+// token vectors X[t][E] (t < T, staged in smem) -> optionally rmsnorm(x_t) * w (w staged in smem
+// at X + TMAX*E by load_tokens) -> int8 blocks of each token in smem. Every loop that holds a
+// shuffle has a block-uniform trip count so the warp stays provably converged; each token gets
+// exactly the arithmetic of a lone token.
 template<class M>
-__device__ __forceinline__ void quant_tokens(const float* X, const float* w, int T) {
+__device__ __forceinline__ void quant_tokens(const float* X, bool w, int T) {
     constexpr int n = M::E, nb = n / 32, TS = M::TS, XE = M::XE;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     if (w) {
@@ -339,15 +348,37 @@ __device__ __forceinline__ void quant_tokens(const float* X, const float* w, int
         }
         __syncthreads();
     }
-    for (int r = 0; r < (T * nb + NW - 1) / NW; r++) {  // (token, block) pairs, uniform trip count
-        const int i0 = warp + r * NW, i = min(i0, T * nb - 1), t = i / nb, b = i % nb, e = b * 32 + lane;
-        const float v = w ? __fmul_rn(__fmul_rn(X[t * n + e], Smem::scale()[t]), __ldg(w + e)) : X[t * n + e];
-        quant32(v, b, reinterpret_cast<int8_t*>(Smem::xq() + t * XE), Smem::xd() + t * TS, Smem::xs8() + t * TS, lane, i0 < T * nb);
+    constexpr int KB = (nb + NW - 1) / NW;              // blocks per warp per token
+    for (int t = 0; t < T; t++) {                       // uniform trip counts
+        float v[KB]; int b[KB]; bool own[KB];
+        #pragma unroll
+        for (int k = 0; k < KB; k++) {
+            own[k] = warp + k * NW < nb; b[k] = min(warp + k * NW, nb - 1);
+            const int e = b[k] * 32 + lane;
+            v[k] = w ? __fmul_rn(__fmul_rn(X[t * n + e], Smem::scale()[t]), X[TMAX * n + e]) : X[t * n + e];
+        }
+        quant32<KB>(v, b, own, reinterpret_cast<int8_t*>(Smem::xq() + t * XE), Smem::xd() + t * TS, Smem::xs8() + t * TS, lane);
     }
     __syncthreads();
 }
-template<class M> __device__ __forceinline__ void load_tokens(float* X, const float* src, int T) {
-    for (int i = threadIdx.x; i < T * M::E; i += NT) X[i] = __ldcg(src + i);
+// stage the T token vectors of src and, if w, the norm weights (at X + TMAX*E) into smem, one batch
+// of loads per token (token 0's batch carries the weights): a single memory latency when T = 1
+template<class M> __device__ __forceinline__ void load_tokens(float* X, const float* src, const float* w, int T) {
+    constexpr int E = M::E, KE = (E + NT - 1) / NT;
+    for (int t = 0; t < T; t++) {
+        float xv[KE], wv[KE];
+        #pragma unroll
+        for (int k = 0; k < KE; k++) {
+            const int i = min(threadIdx.x + k * NT, E - 1);
+            xv[k] = __ldcg(src + t * E + i);
+            if (w && t == 0) wv[k] = __ldg(w + i);
+        }
+        #pragma unroll
+        for (int k = 0; k < KE; k++) {
+            const int i = threadIdx.x + k * NT;
+            if (i < E) { X[t * E + i] = xv[k]; if (w && t == 0) X[TMAX * E + i] = wv[k]; }
+        }
+    }
     __syncthreads();
 }
 // keep the larger (lower index on ties); second = best of everything else
@@ -389,11 +420,13 @@ __device__ __noinline__ void attention(int l, int pos, int T) {
     float* qs = reinterpret_cast<float*>(Smem::uni());           // [t][G][HD] q, scaled to log2 units
     float* scr = qs + TMAX * G * HD;                             // warp states [warp][head][SW]
     const float qscale = __fmul_rn(1.44269504088896341f, C.inv_sqrt_hd);
+    unsigned long long tq = pnow();
     for (int i = tid; i < T * G * HD; i += NT) {
         const int t = i / (G * HD), r = i % (G * HD);
         qs[t * G * HD + r] = __fmul_rn(__ldcg(C.q + t * M::E + kvh * G * HD + r), qscale);
     }
     __syncthreads();
+    mark(tq, 16);
     const float* kb = C.kc + (size_t)l * C.maxseq * KVD + kvh * HD + lane * DPL;
     const float* vb = C.vc + (size_t)l * C.maxseq * KVD + kvh * HD + lane * DPL;
     for (int t = 0; t < T; t++) {
@@ -453,6 +486,7 @@ __device__ __noinline__ void attention(int l, int pos, int T) {
                 ls[j] = l2; m[j] = mx;
             }
         }
+        mark(tq, 17);
         float* sw = scr + warp * G * SW;
         #pragma unroll
         for (int j = 0; j < G; j++) {
@@ -482,6 +516,7 @@ __device__ __noinline__ void attention(int l, int pos, int T) {
             if (lane == 0) { __stcg(C.am + hp, mm); __stcg(C.al + hp, ll); }
         }
         __syncthreads();                        // scratch is reused by the next token
+        mark(tq, 18);
     }
 }
 
@@ -566,7 +601,7 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
     constexpr int XE = M::XE, XF = M::XF, TS = M::TS, PE = XE * TMAX, PF = XF * TMAX;   // PE/PF: part offsets (floats)
     const Smem S;
     __shared__ int stok[TMAX], sdraft[TMAX], sy[TMAX], sK;
-    __shared__ float smg[TMAX];
+    __shared__ float smg[TMAX], sfreq[HD / 2];
     const int c = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     // this CTA's 32-row groups of each matrix (uneven splits when the count isn't a multiple of 8)
     const int qg0 = c * QG / NCTA, nqg = (c + 1) * QG / NCTA - qg0;
@@ -576,9 +611,12 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
     int emitted = 0, pos = 0, cur = 0, K = 0;
     bool gen = false, done = false;
     float acc_num = 0.6f, acc_den = 1.f;    // EWMA of accepted drafts / (accepted + rejections)
-    unsigned long long tm = gtime();
-    if (c == 0 && tid == 0) { g_clk[0] = clock64(); g_clk[1] = tm; }
+    if (tid < 32) s_prof[tid] = 0;
+    if (tid == 0) s_bar_target = 0;
+    if (c == 0 && tid == 0) { g_clk[0] = clock64(); g_clk[1] = gtime(); }
+    unsigned long long tm = pnow();
     for (int i = tid; i < C.P; i += NT) S.hist()[i] = C.prompt[i];
+    if (tid < HD / 2) sfreq[tid] = powf(C.rope_base, -2.f * tid / HD);
 
     while (!done) {
         const int T = gen ? 1 + K : min(C.tchunk, C.P - pos);
@@ -587,24 +625,39 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
         for (int l = 0; l < C.NL; l++) {
             const Layer& L = LY[l];
             // ---- P1: rmsnorm -> int8; this CTA's QKV rows (+bias, RoPE) -> q / KV cache
+            float* B = S.xs(XE) + (TMAX + 1) * E;    // this CTA's QKV biases, staged with the prologue loads
+            if (tid < rq) B[tid] = __ldg(L.bqkv + R0 + tid);
             if (l == 0) {                   // embedding rows (Q4_0 or Q8_0); publish this CTA's slice of h
                 float* X = S.xs(XE);
-                for (int i = tid; i < T * E; i += NT) {
-                    const int t = i / E, e = i % E, j = e % 32;
-                    const size_t blk = (size_t)stok[t] * (E / 32) + e / 32;
-                    if (C.emb_q8) {
-                        const uint8_t* bp = C.emb + blk * 34;
-                        X[i] = __fmul_rn((float)(int8_t)bp[2 + j], __half2float(*reinterpret_cast<const __half*>(bp)));
-                    } else {
-                        const uint8_t* bp = C.emb + blk * 18;
-                        const int qv = j < 16 ? (bp[2 + j] & 0xF) : (bp[2 + j - 16] >> 4);
-                        X[i] = __fmul_rn((float)(qv - 8), __half2float(*reinterpret_cast<const __half*>(bp)));
+                constexpr int KE = (E + NT - 1) / NT;
+                for (int t = 0; t < T; t++) {   // one batch of loads per token (token 0 also stages the norm)
+                    float xv[KE], wv[KE];
+                    #pragma unroll
+                    for (int k = 0; k < KE; k++) {
+                        const int e = min(tid + k * NT, E - 1), j = e % 32;
+                        const size_t blk = (size_t)stok[t] * (E / 32) + e / 32;
+                        if (C.emb_q8) {
+                            const uint8_t* bp = C.emb + blk * 34;
+                            xv[k] = __fmul_rn((float)(int8_t)bp[2 + j], __half2float(*reinterpret_cast<const __half*>(bp)));
+                        } else {
+                            const uint8_t* bp = C.emb + blk * 18;
+                            const int qv = j < 16 ? (bp[2 + j] & 0xF) : (bp[2 + j - 16] >> 4);
+                            xv[k] = __fmul_rn((float)(qv - 8), __half2float(*reinterpret_cast<const __half*>(bp)));
+                        }
+                        if (t == 0) wv[k] = __ldg(L.an + e);
                     }
-                    if (e >= O0 && e < O0 + ro) __stcg(C.h + i, X[i]);
+                    #pragma unroll
+                    for (int k = 0; k < KE; k++) {
+                        const int e = tid + k * NT;
+                        if (e >= E) continue;
+                        X[t * E + e] = xv[k];
+                        if (t == 0) X[TMAX * E + e] = wv[k];
+                        if (e >= O0 && e < O0 + ro) __stcg(C.h + t * E + e, xv[k]);
+                    }
                 }
                 __syncthreads();
-            } else load_tokens<M>(S.xs(XE), C.h, T);
-            quant_tokens<M>(S.xs(XE), L.an, T);
+            } else load_tokens<M>(S.xs(XE), C.h, L.an, T);
+            quant_tokens<M>(S.xs(XE), true, T);
             mark(tm, 0);
             gemv_part(L.qkv, qg0, nqg, PE, 0, T, XE, warp, lane);
             __syncthreads();
@@ -616,7 +669,7 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
                     const int t = i / rq, r = i % rq;
                     float v = pt[t * rq + r];
                     for (int sp = 1; sp < ks; sp++) v = __fadd_rn(v, pt[sp * ss + t * rq + r]);
-                    S.hb()[i] = __fadd_rn(v, __ldg(L.bqkv + R0 + r));
+                    S.hb()[i] = __fadd_rn(v, B[r]);
                 }
             }
             __syncthreads();
@@ -627,7 +680,7 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
                 if (R >= (NH + NKV) * HD) continue;                   // v rows
                 const int ip = (R % HD) / 2;
                 float* p = S.hb() + t * rq + 2 * pr;
-                const float th = (pos + t) * powf(C.rope_base, -2.f * ip / HD), cs = cosf(th), sn = sinf(th);
+                const float th = (pos + t) * sfreq[ip], cs = cosf(th), sn = sinf(th);
                 const float x0 = p[0], x1 = p[1];
                 p[0] = x0 * cs - x1 * sn; p[1] = x0 * sn + x1 * cs;
             }
@@ -649,28 +702,44 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
             mark(tm, 4);
 
             // ---- P3: combine chunk partials -> attention output -> int8; Wo rows; residual
-            if (tid < T * NHC) {                    // softmax weight of each (token, head, chunk)
-                const int t = tid / NHC, hp = t * NHC + ((tid % NHC) / NCH) * NCH;
-                float Mx = -INFINITY, den = 0.f;
-                for (int k = 0; k < NCH; k++) Mx = fmaxf(Mx, __ldcg(C.am + hp + k));
-                for (int k = 0; k < NCH; k++) {
-                    const float mk = __ldcg(C.am + hp + k);
-                    if (mk != -INFINITY) den = __fmaf_rn(__ldcg(C.al + hp + k), exp2f(mk - Mx), den);
-                }
-                const float mk = __ldcg(C.am + tid);                // partial maxima are in log2 units
-                S.wts()[tid] = mk == -INFINITY ? 0.f : __fdiv_rn(exp2f(mk - Mx), den);
-            }
-            __syncthreads();
-            {
+            {   // merge the NCH chunk partials of every (token, head, dim). Per token, the outputs' loads
+                // are issued together with the (m, l) loads behind the softmax weights.
+                constexpr int KE = (E + NT - 1) / NT;
                 float* X = S.xs(XE);
-                for (int i = tid; i < T * E; i += NT) {
-                    const int t = i / E, idx = i % E, hp = t * NHC + (idx / HD) * NCH, e = idx % HD;
-                    float acc = 0.f;
-                    for (int q = 0; q < NCH; q++) acc = __fmaf_rn(__ldcg(C.ao + (size_t)(hp + q) * HD + e), S.wts()[hp + q], acc);
-                    X[i] = acc;
+                float* wts = S.red();                   // [head][chunk] weights of the current token
+                for (int t = 0; t < T; t++) {
+                    float ao[KE][NCH];
+                    #pragma unroll
+                    for (int k = 0; k < KE; k++) {
+                        const int idx = min(tid + k * NT, E - 1), hp = t * NHC + (idx / HD) * NCH, e = idx % HD;
+                        #pragma unroll
+                        for (int q = 0; q < NCH; q++) ao[k][q] = __ldcg(C.ao + (size_t)(hp + q) * HD + e);
+                    }
+                    if (tid < NHC) {                    // partial maxima are in log2 units
+                        const int hp = t * NHC + (tid / NCH) * NCH;
+                        float am[NCH], al[NCH], Mx = -INFINITY, den = 0.f;
+                        #pragma unroll
+                        for (int q = 0; q < NCH; q++) { am[q] = __ldcg(C.am + hp + q); al[q] = __ldcg(C.al + hp + q); }
+                        #pragma unroll
+                        for (int q = 0; q < NCH; q++) Mx = fmaxf(Mx, am[q]);
+                        #pragma unroll
+                        for (int q = 0; q < NCH; q++) if (am[q] != -INFINITY) den = __fmaf_rn(al[q], exp2f(am[q] - Mx), den);
+                        const float mk = am[tid % NCH];
+                        wts[tid] = mk == -INFINITY ? 0.f : __fdiv_rn(exp2f(mk - Mx), den);
+                    }
+                    __syncthreads();
+                    #pragma unroll
+                    for (int k = 0; k < KE; k++) {
+                        const int idx = tid + k * NT;
+                        if (idx >= E) continue;
+                        float acc = 0.f;
+                        #pragma unroll
+                        for (int q = 0; q < NCH; q++) acc = __fmaf_rn(ao[k][q], wts[(idx / HD) * NCH + q], acc);
+                        X[t * E + idx] = acc;
+                    }
+                    __syncthreads();                    // wts is rewritten for the next token
                 }
-                __syncthreads();
-                quant_tokens<M>(X, nullptr, T);
+                quant_tokens<M>(X, false, T);
             }
             mark(tm, 5);
             gemv_part(L.o, eg0, neg, PE, 0, T, XE, warp, lane);
@@ -690,8 +759,8 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
             mark(tm, 7);
 
             // ---- P4: rmsnorm -> int8; gate/up rows; SwiGLU -> int8 act (global)
-            load_tokens<M>(S.xs(XE), C.h, T);
-            quant_tokens<M>(S.xs(XE), L.fn, T);
+            load_tokens<M>(S.xs(XE), C.h, L.fn, T);
+            quant_tokens<M>(S.xs(XE), true, T);
             mark(tm, 8);
             float* gu = S.part(XE);   // T = 1: [gate splits | up splits]; T > 1: [gate][tok] | [up][tok] totals
             const int ksg = L.g.ks;   // == L.u.ks
@@ -704,28 +773,21 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
             }
             __syncthreads();
             mark(tm, 9);
-            for (int r = 0; r < (T * nfg + NW - 1) / NW; r++) {     // uniform trip count: shuffles below
-                const int i = min(warp + r * NW, T * nfg - 1), t = i / nfg, b = i % nfg, j = b * 32 + lane;
-                const bool own = warp + r * NW < T * nfg;
-                float gv, uv;
-                if (T == 1) {                   // splits summed in order, as gemv_seq does for T > 1
-                    gv = gu[j]; uv = gu[ksg * rf + j];
-                    for (int sp = 1; sp < ksg; sp++) { gv = __fadd_rn(gv, gu[sp * rf + j]); uv = __fadd_rn(uv, gu[(ksg + sp) * rf + j]); }
-                } else { gv = gu[t * rf + j]; uv = gu[(TMAX + t) * rf + j]; }
-                const float av = __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.f, expf(-gv))), uv);
-                float a = fabsf(av);
+            constexpr int KG = ((FG + NCTA - 1) / NCTA + NW - 1) / NW;   // row groups per warp per token
+            for (int t = 0; t < T; t++) {       // uniform trip counts: shuffles inside quant32
+                float av[KG]; int b[KG]; bool own[KG];
                 #pragma unroll
-                for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(FULL, a, o));
-                const float inv = (a > 0.f) ? 127.f / a : 0.f;
-                const int q = __float2int_rn(av * inv);
-                if (own) C.act_q[t * FF + F0 + j] = (int8_t)q;
-                int s = q;
-                #pragma unroll
-                for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
-                if (own && lane == 0) {
-                    __stcg(C.act_d + t * TS + fg0 + b, __half2float(__float2half(a / 127.f)));
-                    __stcg(C.act_s8 + t * TS + fg0 + b, 8 * s);
+                for (int k = 0; k < KG; k++) {
+                    own[k] = warp + k * NW < nfg; b[k] = min(warp + k * NW, nfg - 1);
+                    const int j = b[k] * 32 + lane;
+                    float gv, uv;
+                    if (T == 1) {               // splits summed in order, as gemv_seq does for T > 1
+                        gv = gu[j]; uv = gu[ksg * rf + j];
+                        for (int sp = 1; sp < ksg; sp++) { gv = __fadd_rn(gv, gu[sp * rf + j]); uv = __fadd_rn(uv, gu[(ksg + sp) * rf + j]); }
+                    } else { gv = gu[t * rf + j]; uv = gu[(TMAX + t) * rf + j]; }
+                    av[k] = __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.f, expf(-gv))), uv);
                 }
+                quant32<KG>(av, b, own, C.act_q + t * FF + F0, C.act_d + t * TS + fg0, C.act_s8 + t * TS + fg0, lane);
             }
             grid_sync();
             mark(tm, 10);
@@ -758,8 +820,8 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
         if (first >= T) { pos += T; continue; }    // prompt chunk before the last prompt token
 
         // ---- lm_head over this CTA's row groups + per-token argmax (with runner-up for the margin)
-        load_tokens<M>(S.xs(XE), C.h, T);
-        quant_tokens<M>(S.xs(XE), C.out_norm, T);
+        load_tokens<M>(S.xs(XE), C.h, C.out_norm, T);
+        quant_tokens<M>(S.xs(XE), true, T);
         mark(tm, 14);
         lm_head<XE>(c * C.glm / NCTA, (c + 1) * C.glm / NCTA, T, warp, lane);
         __syncthreads();
@@ -770,20 +832,25 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
         }
         grid_sync();
         mark(tm, 15);
-        if (tid < T) {                          // every CTA merges the same candidates: all agree
-            float best = -INFINITY, second = -INFINITY; int bi = INT_MAX;
-            for (int k = 0; k < NCTA; k++) {
-                const Cand* cp = C.cand + k * TMAX + tid;
-                cand_merge(best, bi, second, __ldcg(&cp->best), __ldcg(&cp->idx), __ldcg(&cp->second));
+        if (warp == 0) {                        // every CTA merges the same candidates: all agree. Lane =
+            for (int base = 0; base < T * NCTA; base += 32) {   // (token, CTA); top-2 merging is
+                const int i = base + lane, t = i / NCTA;        // associative, so a shuffle tree gives
+                float b = -INFINITY, s2 = -INFINITY; int bi = INT_MAX;   // the sequential result
+                if (t < T) { const Cand* cp = C.cand + (i % NCTA) * TMAX + t; b = __ldcg(&cp->best); bi = __ldcg(&cp->idx); s2 = __ldcg(&cp->second); }
+                #pragma unroll
+                for (int o = NCTA / 2; o; o >>= 1)
+                    cand_merge(b, bi, s2, __shfl_xor_sync(FULL, b, o), __shfl_xor_sync(FULL, bi, o), __shfl_xor_sync(FULL, s2, o));
+                if (i % NCTA == 0 && t < T) { sy[t] = bi; smg[t] = b - s2; }
             }
-            sy[tid] = bi; smg[tid] = best - second;
         }
         __syncthreads();
-        auto emit = [&](int t) {                // commit prediction t of this step
-            if (c == 0 && tid == 0) {           // publish to the host ring
-                C.r_tok[emitted] = sy[t]; C.r_ns[emitted] = (long long)gtime(); C.r_margin[emitted] = smg[t];
-                __threadfence_system();
-                *(volatile int*)C.r_count = emitted + 1;
+        auto emit = [&](int t) {                // commit prediction t of this step to the host ring
+            if (c == 0 && tid == 0) {           // the system fence stalls the CTA for ~10 us: publish the
+                C.r_tok[emitted] = sy[t]; C.r_ns[emitted] = (long long)gtime(); C.r_margin[emitted] = smg[t];   // ring
+                if (emitted == 0 || (emitted + 1) % 4 == 0) {   // first token, then every 4th (and at exit)
+                    __threadfence_system();
+                    *(volatile int*)C.r_count = emitted + 1;
+                }
             }
             emitted++;
         };
@@ -827,7 +894,12 @@ __global__ void __launch_bounds__(NT, 1) mega(int n_gen) {
         __syncthreads();
         K = sK;
     }
-    if (c == 0 && tid == 0) { g_clk[2] = clock64(); g_clk[3] = gtime(); }
+    if (c == 0 && tid == 0) {
+        __threadfence_system();
+        *(volatile int*)C.r_count = emitted;
+        g_clk[2] = clock64(); g_clk[3] = gtime();
+        for (int k = 0; k < 32; k++) g_prof[k] = s_prof[k];
+    }
 }
 
 // streams `n4` 16-byte words (the weight arena) so the DVFS governors ramp both the GPU clock
@@ -952,7 +1024,7 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
     cfg.ts = TS;
     const int V = (int)g.tokens().size();
     REQUIRE(cfg.NL >= 1 && cfg.NL <= 64 && V % 32 == 0 && cfg.tchunk >= 1 && cfg.tchunk <= TMAX && cfg.P >= 1);
-    REQUIRE(NCTA % NKV == 0 && TMAX * NHC <= NT && (E / 32) % 4 == 0 && (FF / 32) % 4 == 0);
+    REQUIRE(NCTA % NKV == 0 && NHC <= NT && NHC <= TMAX * NW && (E / 32) % 4 == 0 && (FF / 32) % 4 == 0);
     cfg.glm = V / 32;
 
     // split-K per matrix kind, and the dynamic smem layout: the union holds the phase's int8
@@ -966,7 +1038,8 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
     size_t uni = 0;
     auto need = [&](size_t b) { if (b > uni) uni = b; };
     const size_t xe = (size_t)M::XE * TMAX * 4, xf = (size_t)M::XF * TMAX * 4;
-    need(xe + (size_t)TMAX * E * 4);                                     // staged token vectors
+    need(xe + ((size_t)(TMAX + 1) * E + rqmax) * 4);                     // staged token vectors, norm weights, QKV bias
+    REQUIRE(rqmax <= NT && (size_t)ks_qkv * rqmax <= (size_t)TMAX * E);   // P1 partials must not reach the bias
     need(xe + (size_t)ks_qkv * TMAX * rqmax * 4);                        // P1
     need(xe + (size_t)ks_o * TMAX * romax * 4);                          // P3
     need(xe + (size_t)std::max(2 * ks_gu, 2 * TMAX) * rfmax * 4);        // P4
@@ -977,8 +1050,7 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
     cfg.off_xs8 = cfg.off_xd + TMAX * TS * 4;
     cfg.off_hb = cfg.off_xs8 + TMAX * TS * 4;
     cfg.off_red = (int)al16(cfg.off_hb + (size_t)TMAX * rqmax * 4);
-    cfg.off_wts = (int)al16(cfg.off_red + TMAX * NW * 4);
-    cfg.off_cand = (int)al16(cfg.off_wts + (size_t)TMAX * NHC * 4);
+    cfg.off_cand = (int)al16(cfg.off_red + TMAX * NW * 4);
     cfg.off_scale = (int)al16(cfg.off_cand + (size_t)NW * TMAX * sizeof(Cand));
     cfg.off_hist = (int)al16(cfg.off_scale + TMAX * 4);
     const size_t smem_bytes = cfg.off_hist + (size_t)cfg.maxseq * 4;
@@ -1055,16 +1127,14 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
     int* dprompt = (int*)dalloc(ids.size() * 4);
     CK(cudaMemcpy(dprompt, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
     cfg.prompt = dprompt;
-    int *h_count, *h_tok; long long* h_ns; float* h_margin;           // mapped ring
+    int *h_count, *h_tok;                                              // mapped ring
     CK(cudaHostAlloc(&h_count, 4, cudaHostAllocMapped)); *h_count = 0;
     const int nring = cfg.P + n_gen;
     CK(cudaHostAlloc(&h_tok, nring * 4, cudaHostAllocMapped));
-    CK(cudaHostAlloc(&h_ns, nring * 8, cudaHostAllocMapped));
-    CK(cudaHostAlloc(&h_margin, nring * 4, cudaHostAllocMapped));
+    std::vector<long long> h_ns(nring); std::vector<float> h_margin(nring);   // stats only: device, copied at exit
+    cfg.r_ns = (long long*)dalloc((size_t)nring * 8); cfg.r_margin = (float*)dalloc((size_t)nring * 4);
     CK(cudaHostGetDevicePointer((void**)&cfg.r_count, h_count, 0));
     CK(cudaHostGetDevicePointer((void**)&cfg.r_tok, h_tok, 0));
-    CK(cudaHostGetDevicePointer((void**)&cfg.r_ns, h_ns, 0));
-    CK(cudaHostGetDevicePointer((void**)&cfg.r_margin, h_margin, 0));
     CK(cudaMemcpyToSymbol(C, &cfg, sizeof cfg));
     CK(cudaMemcpyToSymbol(LY, ly.data(), ly.size() * sizeof(Layer)));
     fprintf(stderr, "minfer-mega: qwen2 L=%d d=%d ff=%d H=%d/%d hd=%d vocab=%d | weights %.1f MB in one arena | %d CTAs x %d thr, smem %zu B, "
@@ -1089,6 +1159,8 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
         fprintf(stderr, "minfer-mega: GPU clock %ld MHz -> %ld MHz after %d ms warm-up\n", mhz0, gpu_mhz(), ms);
     }
     auto t0 = std::chrono::steady_clock::now();
+    const unsigned zero = 0;
+    CK(cudaMemcpyToSymbol(g_bar_count, &zero, sizeof zero));
     CK(cudaLaunchCooperativeKernel((void*)mega<M>, NCTA, NT, args, smem_bytes, s));
     int seen = 0; double ttft_ms = -1;
     for (;;) {
@@ -1105,6 +1177,8 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     CK(cudaStreamSynchronize(s));
+    CK(cudaMemcpy(h_ns.data(), cfg.r_ns, (size_t)nring * 8, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_margin.data(), cfg.r_margin, (size_t)nring * 4, cudaMemcpyDeviceToHost));
     const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     printf("\n");
     const int n = seen;
@@ -1130,7 +1204,8 @@ static int run(GGUF& g, int n_gen, const std::vector<int>& ids, bool raw_ids) {
                 agree, total, cfg.P, total_ms, total_ms * cfg.tchunk / cfg.P, cfg.tchunk, hsh);
     }
     if (cfg.prof) {
-        unsigned long long pr[32]; CK(cudaMemcpyFromSymbol(pr, g_prof, sizeof pr));
+        unsigned long long pr[32], kc[4]; CK(cudaMemcpyFromSymbol(pr, g_prof, sizeof pr)); CK(cudaMemcpyFromSymbol(kc, g_clk, sizeof kc));
+        for (auto& v : pr) v = (unsigned long long)((double)v * (double)(kc[3] - kc[1]) / (double)(kc[2] - kc[0]));   // cycles -> ns
         const char* ph[6] = {"P1 QKV", "P2 attention", "P3 Wo", "P4 gate/up", "P5 down", "lm_head"};
         const int first[7] = {0, 3, 5, 8, 11, 14, 16};
         double tot = 0;
