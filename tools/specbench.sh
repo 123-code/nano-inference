@@ -2,6 +2,8 @@
 # Speculative-decoding benchmark over a fixed prompt suite: cuda_infer (plain and its own SPEC=1)
 # vs mega (SPEC=0 and SPEC=1). Checks that mega's speculative output is token-for-token its plain
 # output (it must be: lossless by construction), and reports tok/s and tokens per step.
+# Text mode: each run stops at <|im_end|>. Decoding past it measures the model replaying the
+# conversation, which n-gram drafts predict very well (M17's JSON number was inflated that way).
 # Usage: tools/specbench.sh [n_gen]   env: MODEL, CUDA_INFER, MEGA, ORACLE
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -26,10 +28,10 @@ for i in "${!prompts[@]}"; do
       | sed -n 's/^INPUT //p' > "$f"
   done
   ids=$(cat "$f")
-  RAWIDS=1 "$CUDA_INFER" "$MODEL" "$N" $ids >/dev/null 2>"$T/c0.err"
-  RAWIDS=1 SPEC=1 "$CUDA_INFER" "$MODEL" "$N" $ids >/dev/null 2>"$T/c1.err"
-  a=$(RAWIDS=1 SPEC=0 "$MEGA" "$MODEL" "$N" $ids 2>"$T/m0.err")
-  b=$(RAWIDS=1 SPEC=1 "$MEGA" "$MODEL" "$N" $ids 2>"$T/m1.err")
+  "$CUDA_INFER" "$MODEL" "$N" $ids >/dev/null 2>"$T/c0.err"
+  SPEC=1 "$CUDA_INFER" "$MODEL" "$N" $ids >/dev/null 2>"$T/c1.err"
+  a=$(SPEC=0 "$MEGA" "$MODEL" "$N" $ids 2>"$T/m0.err")
+  b=$(SPEC=1 "$MEGA" "$MODEL" "$N" $ids 2>"$T/m1.err")
   tps=$(sed -n 's/.*steps, \([0-9.]*\) tokens\/step.*/\1/p' "$T/m1.err")
   chk=$([ "$a" = "$b" ] && echo "identical" || echo "DIFFERENT")
   printf "%-36.36s %9s %9s %9s %9s %7s %s\n" "${prompts[$i]}" "$(rate $T/c0.err)" "$(rate $T/c1.err)" "$(rate $T/m0.err)" "$(rate $T/m1.err)" "$tps" "$chk"
