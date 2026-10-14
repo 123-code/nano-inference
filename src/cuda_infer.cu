@@ -5,6 +5,7 @@
 //
 //   cuda_infer <model.gguf> <n_gen> <id0> <id1> ...
 #include "gguf.h"
+#include "detok.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -840,42 +841,6 @@ static DTensor dt_q4_0r_from(const Tensor& t) {
     return DTensor{GT_Q4_0, in, out, dq, ds};
 }
 static DTensor dt_w(const Tensor& t) { return (t.type == GT_Q4_0) ? dt_q4r(t) : dt_q4_0r_from(t); }
-// ---- GPT2 byte-level BPE detokenizer ----
-// Qwen2 vocab pieces are stored as UTF-8 of a reversible byte->unicode map (the
-// GPT2 "bytes_to_unicode" trick: control/space bytes are remapped to printable
-// codepoints so the BPE alphabet has no whitespace). To get real text back we
-// reverse it: decode each piece's UTF-8 to codepoints, map each codepoint to its
-// original byte. cp2byte must be sized >= 324 (max remapped codepoint = 323).
-static void build_byte_decoder(int* cp2byte) {
-    for (int i = 0; i < 324; i++) cp2byte[i] = -1;
-    std::vector<int> bs, cs;
-    for (int b = '!';  b <= '~';  b++) bs.push_back(b);
-    for (int b = 0xA1; b <= 0xAC; b++) bs.push_back(b);
-    for (int b = 0xAE; b <= 0xFF; b++) bs.push_back(b);
-    cs = bs;
-    int n = 0;
-    for (int b = 0; b < 256; b++) {
-        if (std::find(bs.begin(), bs.end(), b) == bs.end()) { bs.push_back(b); cs.push_back(256 + n++); }
-    }
-    for (size_t i = 0; i < bs.size(); i++) cp2byte[cs[i]] = bs[i];
-}
-
-// Decode one vocab piece (UTF-8 of remapped codepoints) into raw bytes, appended to out.
-static void detok_piece(const std::string& s, const int* cp2byte, std::string& out) {
-    for (size_t i = 0; i < s.size(); ) {
-        unsigned char c = (unsigned char)s[i];
-        int cp, len;
-        if      (c < 0x80)        { cp = c;        len = 1; }
-        else if ((c >> 5) == 0x6) { cp = c & 0x1F; len = 2; }
-        else if ((c >> 4) == 0xE) { cp = c & 0x0F; len = 3; }
-        else if ((c >> 3) == 0x1E){ cp = c & 0x07; len = 4; }
-        else { i++; continue; }
-        for (int k = 1; k < len && i + k < s.size(); k++) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
-        i += len;
-        if (cp >= 0 && cp < 324 && cp2byte[cp] >= 0) out.push_back((char)cp2byte[cp]);
-    }
-}
-
 int main(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s <model.gguf> <n_gen> <id...>\n", argv[0]); return 1; }
     GGUF g(argv[1]);
@@ -1180,10 +1145,19 @@ int main(int argc, char** argv) {
     } else {
         // prefill: override d_token with each prompt token (the graph's own argmax
         // write is discarded until the last prompt token, which yields token #1).
+        // TEACHER=k: ids = a reference sequence whose first k are the prompt; record the
+        // argmax after every position and report top-1 agreement with the next reference token.
+        int teacher = getenv("TEACHER") ? atoi(getenv("TEACHER")) : 0, agree = 0, total = 0;
         for (size_t i = 0; i < ids.size(); i++) {
             CK(cudaMemcpyAsync(d_token, &ids[i], 4, cudaMemcpyHostToDevice, s));
             CK(cudaGraphLaunch(exec_for((int)i), s));          // pos i
+            if (teacher && (int)i >= teacher - 1 && i + 1 < ids.size()) {
+                int pred; CK(cudaMemcpy(&pred, d_token, 4, cudaMemcpyDeviceToHost));
+                total++; if (pred == ids[i + 1]) agree++;
+                else fprintf(stderr, "  pos %zu: ref %d, cuda_infer %d\n", i + 1, ids[i + 1], pred);
+            }
         }
+        if (teacher) { fprintf(stderr, "teacher-forced top-1 agreement: %d/%d\n", agree, total); return 0; }
     }
     cudaEventRecord(p1, s); cudaEventSynchronize(p1);
     float pms = 0; cudaEventElapsedTime(&pms, p0, p1);

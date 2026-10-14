@@ -26,6 +26,9 @@ if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   add_executable(cuda_infer src/cuda_infer.cu)
   set_target_properties(cuda_infer PROPERTIES CUDA_ARCHITECTURES 87)
+  # --- M15: whole decode loop in one persistent kernel ---
+  add_executable(mega src/mega.cu)
+  set_target_properties(mega PROPERTIES CUDA_ARCHITECTURES 87)
 endif()
 
 # --- reference oracle (links prebuilt libllama) ---

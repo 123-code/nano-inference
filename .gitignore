@@ -1,0 +1,15 @@
+# build artifacts
+build/
+
+# model weights / converted data (large, not source)
+*.gguf
+*.bin
+out/
+
+# editor / OS
+*.o
+*.swp
+.DS_Store
+
+# python bytecode
+__pycache__/
